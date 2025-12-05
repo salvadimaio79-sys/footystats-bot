@@ -32,12 +32,19 @@ RAPIDAPI_HOST = "soccer-football-info.p.rapidapi.com"
 
 # Settings
 AVG_THRESHOLD = float(os.getenv("AVG_THRESHOLD", "2.70"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))  # 3 minuti
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
 
 # Cache
 notified_matches = set()
 footystats_cache = {"data": [], "timestamp": 0}
-CACHE_TTL = 1800  # 30 minuti
+CACHE_TTL = 1800
+
+# Lista squadre note con AVG alto (fallback se API FootyStats non funziona)
+HIGH_AVG_TEAMS = [
+    "bayern", "barcelona", "real madrid", "psg", "manchester city",
+    "liverpool", "dortmund", "napoli", "inter", "milan", "roma",
+    "ajax", "benfica", "porto", "celtic", "rangers"
+]
 
 # =========================
 # Telegram
@@ -68,20 +75,45 @@ def get_footystats_matches():
     
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        url = "https://api.footystats.org/v2/matches"
-        params = {"key": FOOTYSTATS_API_KEY, "date": today, "include_stats": "true"}
+        
+        # Prova endpoint principale
+        url = f"https://api.footystats.org/v2/matches"
+        params = {"key": FOOTYSTATS_API_KEY, "date": today}
         
         logger.info(f"📥 FootyStats: {today}")
         r = requests.get(url, params=params, timeout=30)
         
         if not r.ok:
-            logger.error(f"❌ FootyStats: {r.status_code}")
+            logger.error(f"❌ FootyStats: HTTP {r.status_code}")
+            logger.error(f"   Response: {r.text[:300]}")
+            
+            # Verifica se la chiave è valida
+            if r.status_code == 401 or r.status_code == 403:
+                logger.error("   ⚠️ API Key non valida o scaduta!")
+                send_telegram(
+                    "⚠️ <b>ATTENZIONE</b>\n\n"
+                    "API Key FootyStats non valida!\n"
+                    "Controlla su: footystats.org/api-dashboard\n\n"
+                    "Il bot continuerà usando squadre note."
+                )
+            
+            # FALLBACK: usa lista squadre note
+            logger.info("🔄 Uso fallback: squadre note con AVG alto")
             return []
         
-        data = r.json().get("data", [])
-        matches = []
+        data = r.json()
         
-        for m in data:
+        # Controlla struttura risposta
+        if "data" not in data:
+            logger.error(f"❌ Struttura inaspettata: {list(data.keys())}")
+            return []
+        
+        matches = data.get("data", [])
+        logger.info(f"✅ FootyStats: {len(matches)} match totali")
+        
+        # Filtra per AVG
+        filtered = []
+        for m in matches:
             try:
                 stats = m.get("pre_match_stats", {})
                 avg = stats.get("avg_goals_per_match_both", 0.0)
@@ -93,21 +125,22 @@ def get_footystats_matches():
                         avg = (ah + aa) / 2
                 
                 if avg >= AVG_THRESHOLD:
-                    matches.append({
+                    filtered.append({
                         "home": m.get("homeTeam", {}).get("name", ""),
                         "away": m.get("awayTeam", {}).get("name", ""),
                         "league": m.get("competition", {}).get("name", ""),
                         "avg": avg
                     })
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Errore parsing match: {e}")
         
-        logger.info(f"✅ FootyStats: {len(matches)} match AVG>={AVG_THRESHOLD}")
-        footystats_cache = {"data": matches, "timestamp": now}
-        return matches
+        logger.info(f"✅ Filtrati AVG>={AVG_THRESHOLD}: {len(filtered)} match")
+        
+        footystats_cache = {"data": filtered, "timestamp": now}
+        return filtered
         
     except Exception as e:
-        logger.error(f"❌ FootyStats error: {e}")
+        logger.error(f"❌ FootyStats exception: {e}")
         return []
 
 # =========================
@@ -118,24 +151,23 @@ def get_live_matches():
         url = f"https://{RAPIDAPI_HOST}/live/full/?l=en_USA&json=on"
         headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
         
+        logger.info("📥 Richiesta live matches...")
         r = requests.get(url, headers=headers, timeout=20)
         
         if not r.ok:
             logger.error(f"❌ RapidAPI: {r.status_code}")
+            logger.error(f"   Response: {r.text[:300]}")
             return []
         
         data = r.json()
         
-        # Estrai match live
+        # Estrai eventi
         live = []
         
-        # Struttura tipica: {"result": [{"events": [...]}]}
         if isinstance(data, dict):
-            # Cerca eventi nelle possibili chiavi
             events = data.get("result", data.get("events", data.get("data", [])))
             
             if isinstance(events, list) and events:
-                # Se il primo elemento ha "events" dentro, estrailo
                 if isinstance(events[0], dict) and "events" in events[0]:
                     events = events[0]["events"]
                 
@@ -149,7 +181,6 @@ def get_live_matches():
                             home_score = score.get("home", score.get("current", {}).get("home", 0))
                             away_score = score.get("away", score.get("current", {}).get("away", 0))
                         else:
-                            # Fallback: parse stringa tipo "0-0"
                             parts = str(score).split("-")
                             home_score = int(parts[0]) if len(parts) > 0 else 0
                             away_score = int(parts[1]) if len(parts) > 1 else 0
@@ -165,14 +196,14 @@ def get_live_matches():
                             "period": str(period).upper(),
                             "league": e.get("tournament", {}).get("name", e.get("league", ""))
                         })
-                    except:
-                        pass
+                    except Exception as e_parse:
+                        logger.debug(f"Errore parsing evento: {e_parse}")
         
         logger.info(f"🔴 Live: {len(live)} match")
         return live
         
     except Exception as e:
-        logger.error(f"❌ RapidAPI error: {e}")
+        logger.error(f"❌ RapidAPI exception: {e}")
         return []
 
 # =========================
@@ -182,6 +213,11 @@ def normalize(name):
     name = "".join(c for c in unicodedata.normalize("NFKD", name or "") if not unicodedata.combining(c))
     name = re.sub(r"[^a-z0-9]+", " ", name.lower())
     return " ".join(name.split())
+
+def is_high_avg_team(team_name):
+    """Verifica se squadra è nella lista high AVG (fallback)."""
+    norm = normalize(team_name)
+    return any(t in norm for t in HIGH_AVG_TEAMS)
 
 def match_teams(fs, live):
     stopwords = {"fc", "cf", "sc", "ac", "club", "cd", "u19", "u20", "u21", "u23", "b", "ii", "iii"}
@@ -203,24 +239,19 @@ def match_teams(fs, live):
 # Logic
 # =========================
 def is_halftime_00(live):
-    """Verifica se è HT con 0-0"""
     period = live.get("period", "")
-    
-    # Possibili valori: "HT", "HALFTIME", "HALF_TIME", etc.
     if "HT" in period or "HALF" in period:
         return live.get("home_score", 0) == 0 and live.get("away_score", 0) == 0
-    
     return False
 
 def check_matches():
     logger.info("=" * 50)
     logger.info("🔍 CHECK")
     
+    # Match FootyStats
     fs = get_footystats_matches()
-    if not fs:
-        logger.info("ℹ️ Nessun match FootyStats")
-        return
     
+    # Match Live
     live = get_live_matches()
     if not live:
         logger.info("ℹ️ Nessun live")
@@ -228,12 +259,47 @@ def check_matches():
     
     found = 0
     
-    for f in fs:
+    # Se FootyStats ha dati, usa quelli
+    if fs:
+        logger.info(f"📊 Confronto {len(fs)} match FootyStats con {len(live)} live")
+        
+        for f in fs:
+            for l in live:
+                if not match_teams(f, l):
+                    continue
+                
+                if not is_halftime_00(l):
+                    continue
+                
+                key = f"{l['home']}|{l['away']}"
+                if key in notified_matches:
+                    continue
+                
+                msg = (
+                    "🚨 <b>SEGNALE OVER 1.5 FT</b>\n\n"
+                    f"⚽ <b>{l['home']} vs {l['away']}</b>\n"
+                    f"🏆 {l['league']}\n"
+                    f"📊 AVG: <b>{f['avg']:.2f}</b>\n"
+                    f"⏱️ <b>INTERVALLO</b> | 1T: <b>0-0</b>\n\n"
+                    "🎯 <b>PUNTA ORA: OVER 1.5 FT</b>\n"
+                    "💡 Quote migliori all'HT!"
+                )
+                
+                if send_telegram(msg):
+                    notified_matches.add(key)
+                    found += 1
+                    logger.info(f"🎉 Notifica: {key}")
+    
+    # FALLBACK: Se FootyStats non funziona, usa squadre note
+    else:
+        logger.info(f"🔄 Modalità fallback: cerco squadre note in {len(live)} live")
+        
         for l in live:
-            if not match_teams(f, l):
+            if not is_halftime_00(l):
                 continue
             
-            if not is_halftime_00(l):
+            # Verifica se almeno una squadra è nota per AVG alto
+            if not (is_high_avg_team(l['home']) or is_high_avg_team(l['away'])):
                 continue
             
             key = f"{l['home']}|{l['away']}"
@@ -244,16 +310,17 @@ def check_matches():
                 "🚨 <b>SEGNALE OVER 1.5 FT</b>\n\n"
                 f"⚽ <b>{l['home']} vs {l['away']}</b>\n"
                 f"🏆 {l['league']}\n"
-                f"📊 AVG: <b>{f['avg']:.2f}</b>\n"
+                f"📊 Squadra top: <b>AVG stimato > 2.70</b>\n"
                 f"⏱️ <b>INTERVALLO</b> | 1T: <b>0-0</b>\n\n"
                 "🎯 <b>PUNTA ORA: OVER 1.5 FT</b>\n"
-                "💡 Quote migliori all'HT!"
+                "💡 Quote migliori all'HT!\n\n"
+                "⚠️ Segnale da lista squadre (FootyStats offline)"
             )
             
             if send_telegram(msg):
                 notified_matches.add(key)
                 found += 1
-                logger.info(f"🎉 Notifica: {key}")
+                logger.info(f"🎉 Notifica (fallback): {key}")
     
     logger.info(f"📊 Opportunità: {found}")
     logger.info("=" * 50)
@@ -266,10 +333,11 @@ def main():
     logger.info(f"⚙️ AVG >= {AVG_THRESHOLD} | Check: {CHECK_INTERVAL}s")
     
     send_telegram(
-        f"🤖 <b>Bot Online</b>\n\n"
+        f"🤖 <b>Bot Online v2</b>\n\n"
         f"📊 AVG: <b>{AVG_THRESHOLD}</b>\n"
         f"⏱️ Check: <b>{CHECK_INTERVAL}s</b>\n"
-        "✅ Monitoraggio HT 0-0 attivo"
+        "✅ Monitoraggio HT 0-0 attivo\n\n"
+        "🔄 Con fallback su squadre top"
     )
     
     while True:
