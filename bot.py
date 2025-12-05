@@ -15,7 +15,7 @@ FOOTYSTATS_API_KEY = os.getenv("FOOTYSTATS_API_KEY", "59c0b4d0f445de0323f7e98880
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9")
 RAPIDAPI_HOST = "soccer-football-info.p.rapidapi.com"
 
-AVG_THRESHOLD = float(os.getenv("AVG_THRESHOLD", "2.70"))
+AVG_THRESHOLD = float(os.getenv("AVG_THRESHOLD", "2.50"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
 FOOTYSTATS_REFRESH = int(os.getenv("FOOTYSTATS_REFRESH", "1800"))
 
@@ -43,7 +43,7 @@ def send_telegram(msg):
 def get_footystats_matches():
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        url = "https://api.football-data-api.com/todays-matches"
+        url = "https://api.footystats.org/league-matches"
         params = {"key": FOOTYSTATS_API_KEY, "date": today}
         
         logger.info(f"FootyStats: richiesta {today}")
@@ -54,6 +54,11 @@ def get_footystats_matches():
             return {}
         
         data = r.json()
+        
+        if not data.get("success"):
+            logger.error(f"FootyStats error: {data.get('message')}")
+            return {}
+        
         matches = data.get("data", [])
         logger.info(f"FootyStats: {len(matches)} match totali")
         
@@ -67,23 +72,29 @@ def get_footystats_matches():
                 if not home or not away:
                     continue
                 
-                stats = m.get("stats", {})
-                avg = float(stats.get("avg_potential", {}).get("home", 0))
+                pre_match_stats = m.get("pre_match_stats", {})
+                
+                avg = float(pre_match_stats.get("avg_goals_per_match_both", 0))
                 
                 if avg == 0:
-                    avg_h = float(stats.get("avg_goals_per_match_home", 0))
-                    avg_a = float(stats.get("avg_goals_per_match_away", 0))
+                    avg_h = float(pre_match_stats.get("avg_goals_per_match_home", 0))
+                    avg_a = float(pre_match_stats.get("avg_goals_per_match_away", 0))
                     if avg_h > 0 and avg_a > 0:
                         avg = (avg_h + avg_a) / 2
                 
                 if avg >= AVG_THRESHOLD:
                     key = f"{normalize(home)}|{normalize(away)}"
+                    
+                    competition = m.get("competition", {})
+                    league = competition.get("name", "") if isinstance(competition, dict) else ""
+                    
                     high_avg[key] = {
                         "home": home,
                         "away": away,
                         "avg": avg,
-                        "league": m.get("competition", {}).get("name", "")
+                        "league": league
                     }
+                    logger.info(f"Match AVG alto: {home} vs {away} | AVG: {avg:.2f}")
             except Exception as e:
                 logger.debug(f"Parse: {e}")
         
@@ -183,7 +194,7 @@ def check_matches():
         last_footystats_update = now
     
     if not footystats_data:
-        logger.info("Nessun match AVG alto")
+        logger.info("Nessun match AVG alto oggi")
         return
     
     live = get_live_matches()
@@ -225,11 +236,11 @@ def check_matches():
     logger.info(f"Opportunita: {found}")
 
 def main():
-    logger.info("BOT FINALE - FootyStats + Bet365")
+    logger.info("BOT FINALE v2 - FootyStats FIXED")
     
     send_telegram(
-        f"🤖 <b>Bot FINALE Online</b>\n\n"
-        f"✅ FootyStats: AVG reale\n"
+        f"🤖 <b>Bot FINALE v2</b>\n\n"
+        f"✅ FootyStats: URL corretto\n"
         f"✅ Bet365: Match live\n"
         f"⏱️ Check: <b>{CHECK_INTERVAL}s</b>\n"
         f"📊 AVG > {AVG_THRESHOLD}"
