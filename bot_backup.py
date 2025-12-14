@@ -15,7 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7912248885:AAFwOdg0rX3weVr
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
 
 # Path CSV (caricato manualmente)
-CSV_PATH = '/mnt/user-data/uploads/matches_today.csv'
+CSV_PATH = '/mnt/user-data/uploads/matches_expanded-1765723121-ilmaestro79.csv'
 
 CHECK_INTERVAL = 900  # 15 minuti
 
