@@ -7,14 +7,15 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Credenziali
+# Credenziali - PROVA ENTRAMBI I NOMI
 FOOTYSTATS_API_KEY = os.getenv('FOOTYSTATS_API_KEY', '59c0b4d0f445de0323f7e98880350ed6c583d74907ae64b9b59cfde6a09dd811')
 RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9')
 RAPIDAPI_HOST = 'soccer-football-info.p.rapidapi.com'
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7969912548:AAFoQzl79K3TiQVnR39ackzVk4JCkDJ3LZQ')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
 
-# FILTRO: Odds Over 2.5 < 1.60 (bookmakers si aspettano 3+ gol)
+# Prova entrambi i token
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_TOKEN', '7969912548:AAFoQzl79K3TiQVnR39ackzVk4JCkDJ3LZQ')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') or os.getenv('CHAT_ID', '6146221712')
+
 ODDS_THRESHOLD = 1.60
 CHECK_INTERVAL = 900
 
@@ -25,8 +26,26 @@ def normalize_team_name(name):
     name = re.sub(r'[^a-z0-9\s]', '', name.lower())
     return ' '.join(name.split())
 
+def get_odds_value(match):
+    """Prova tutti i possibili nomi del campo odds"""
+    possible_names = [
+        'odds_over25',
+        'odds_over_25', 
+        'Odds_Over25',
+        'Odds_Over_25',
+        'oddsOver25',
+        'pre_match_odds_over_25'
+    ]
+    
+    for name in possible_names:
+        value = match.get(name)
+        if value:
+            return value
+    
+    return None
+
 def get_todays_matches():
-    """Prendi match con Odds Over 2.5 basse (TUTTE le leghe!)"""
+    """Prendi match con Odds Over 2.5 basse"""
     try:
         url = "https://api.football-data-api.com/todays-matches"
         r = requests.get(url, params={'key': FOOTYSTATS_API_KEY}, timeout=30)
@@ -38,7 +57,18 @@ def get_todays_matches():
             return []
         
         matches = data.get('data', [])
-        logger.info(f"✅ {len(matches)} match oggi (tutte le leghe)")
+        logger.info(f"✅ {len(matches)} match oggi")
+        
+        # DEBUG: mostra tutti i campi del primo match
+        if matches:
+            first = matches[0]
+            logger.info("\n🔍 DEBUG - Campi disponibili nel primo match:")
+            odds_fields = [k for k in first.keys() if 'odds' in k.lower()]
+            if odds_fields:
+                for field in odds_fields[:10]:  # Mostra primi 10
+                    logger.info(f"   {field}: {first.get(field)}")
+            else:
+                logger.warning("   ⚠️ Nessun campo 'odds' trovato!")
         
         # Filtra per ODDS
         filtered = []
@@ -46,8 +76,8 @@ def get_todays_matches():
             if m.get('status') not in ['notstarted', '']:
                 continue
             
-            # Prendi odds Over 2.5
-            odds_over25 = m.get('odds_over25')
+            # Prendi odds con nome flessibile
+            odds_over25 = get_odds_value(m)
             
             if not odds_over25:
                 continue
@@ -55,7 +85,6 @@ def get_todays_matches():
             try:
                 odds = float(odds_over25)
                 
-                # FILTRO: Odds < 1.60 = bookmakers si aspettano tanti gol!
                 if odds < ODDS_THRESHOLD:
                     filtered.append({
                         'id': m.get('id'),
@@ -65,23 +94,20 @@ def get_todays_matches():
                         'away_normalized': normalize_team_name(m.get('away_name')),
                         'odds_over25': round(odds, 2),
                         'competition_name': m.get('competition_name', 'Unknown'),
-                        'country': m.get('country', 'Unknown'),
-                        'date_unix': m.get('date_unix', 0)
+                        'country': m.get('country', 'Unknown')
                     })
             except:
                 pass
         
-        logger.info(f"📊 {len(filtered)} match con Odds Over 2.5 < {ODDS_THRESHOLD}")
+        logger.info(f"📊 {len(filtered)} match con Odds O2.5 < {ODDS_THRESHOLD}")
         
-        # Ordina per odds (più basse = più probabili)
-        filtered.sort(key=lambda x: x['odds_over25'])
-        
-        # Mostra top 15
-        logger.info("\n🔥 TOP 15 MATCH (più probabili):\n")
-        for m in filtered[:15]:
-            logger.info(f"⚽ {m['home_name']} vs {m['away_name']}")
-            logger.info(f"   🏆 {m['country']} - {m['competition_name']}")
-            logger.info(f"   📊 Odds O2.5: {m['odds_over25']}\n")
+        if filtered:
+            filtered.sort(key=lambda x: x['odds_over25'])
+            logger.info("\n🔥 TOP 10 MATCH:\n")
+            for m in filtered[:10]:
+                logger.info(f"⚽ {m['home_name']} vs {m['away_name']}")
+                logger.info(f"   🏆 {m['competition_name']}")
+                logger.info(f"   📊 Odds: {m['odds_over25']}\n")
         
         return filtered
         
@@ -98,7 +124,7 @@ def get_live_matches():
         r.raise_for_status()
         data = r.json()
         live = data.get('result', [])
-        logger.info(f"⚽ {len(live)} match live")
+        logger.info(f"⚽ {len(live)} live")
         return live
     except Exception as e:
         logger.error(f"❌ Live: {e}")
@@ -118,7 +144,6 @@ def check_halftime_00(monitored, live):
                 timer = l.get('timer', '')
                 minute = int(timer.split(':')[0]) if timer and ':' in timer else 0
                 
-                # HT = tra 44-47 minuti
                 if 44 <= minute <= 47:
                     score_a, score_b = team_a.get('score', {}), team_b.get('score', {})
                     if int(score_a.get('f', 0)) == 0 and int(score_b.get('f', 0)) == 0:
@@ -140,38 +165,35 @@ def send_telegram(msg):
 
 def format_alert(alert):
     m, min = alert['match'], alert['minute']
-    
-    # Calcola probabilità implicita
     odds = m['odds_over25']
-    prob_over25 = round((1 / odds) * 100)
+    prob = round((1 / odds) * 100)
     
-    message = f"""🚨 <b>SEGNALE OVER 1.5 FT</b> 🚨
+    return f"""🚨 <b>SEGNALE OVER 1.5 FT</b> 🚨
 
 ⚽ <b>{m['home_name']} vs {m['away_name']}</b>
 🏆 {m['country']} - {m['competition_name']}
 
 ⏱ <b>INTERVALLO ({min}') - 0-0</b>
 
-📊 <b>Odds Over 2.5: {odds}</b>
-📈 Probabilità Over 2.5: <b>{prob_over25}%</b>
+📊 Odds Over 2.5: <b>{odds}</b>
+📈 Probabilità: <b>{prob}%</b>
 
-💡 <b>STRATEGIA: OVER 1.5 FT</b>
+💡 <b>PUNTA: OVER 1.5 FT</b>
 
 🔥 Bookmakers si aspettavano 3+ gol!
 ✅ Servono solo 2 gol per vincere!
-⚡ Probabilità Over 1.5 molto alta!
 """
-    
-    return message
 
 def main():
     logger.info("="*60)
     logger.info("🤖 BOT BETTING - STRATEGIA ODDS")
-    logger.info(f"📊 Filtro: Odds Over 2.5 < {ODDS_THRESHOLD}")
+    logger.info(f"📊 Filtro: Odds O2.5 < {ODDS_THRESHOLD}")
     logger.info(f"⏱ Check ogni {CHECK_INTERVAL//60} min")
+    logger.info(f"🔑 Telegram Token: {TELEGRAM_BOT_TOKEN[:20]}...")
+    logger.info(f"💬 Chat ID: {TELEGRAM_CHAT_ID}")
     logger.info("="*60)
     
-    send_telegram(f"🤖 Bot avviato!\n📊 Filtro: Odds Over 2.5 < {ODDS_THRESHOLD}")
+    send_telegram(f"🤖 Bot avviato!\n📊 Filtro: Odds O2.5 < {ODDS_THRESHOLD}")
     
     monitored, alerted = [], set()
     todays = get_todays_matches()
@@ -179,24 +201,20 @@ def main():
     if todays:
         monitored = todays
         
-        # Limita messaggi se troppi match
-        if len(monitored) > 20:
-            summary = f"📋 <b>Monitoro {len(monitored)} match (top 20):</b>\n\n"
-            for m in monitored[:20]:
+        if len(monitored) > 15:
+            summary = f"📋 <b>{len(monitored)} match trovati (top 15):</b>\n\n"
+            for m in monitored[:15]:
                 summary += f"• {m['home_name']} vs {m['away_name']}\n"
-                summary += f"  🏆 {m['competition_name']}\n"
-                summary += f"  📊 Odds O2.5: {m['odds_over25']}\n\n"
-            summary += f"...e altri {len(monitored)-20} match"
+                summary += f"  📊 Odds: {m['odds_over25']}\n"
         else:
-            summary = f"📋 <b>Monitoro {len(monitored)} match:</b>\n\n"
+            summary = f"📋 <b>{len(monitored)} match trovati:</b>\n\n"
             for m in monitored:
                 summary += f"• {m['home_name']} vs {m['away_name']}\n"
-                summary += f"  🏆 {m['competition_name']}\n"
-                summary += f"  📊 Odds O2.5: {m['odds_over25']}\n\n"
+                summary += f"  📊 Odds: {m['odds_over25']}\n"
         
         send_telegram(summary)
     else:
-        send_telegram(f"⚠️ Nessun match oggi con Odds O2.5 < {ODDS_THRESHOLD}")
+        send_telegram(f"⚠️ Nessun match con Odds O2.5 < {ODDS_THRESHOLD}")
     
     while True:
         try:
@@ -210,16 +228,12 @@ def main():
                             send_telegram(format_alert(alert))
                             alerted.add(alert['match']['id'])
             
-            # Refresh ogni ora
             if datetime.now().minute == 0:
-                logger.info("🔄 Refresh lista...")
+                logger.info("🔄 Refresh...")
                 todays = get_todays_matches()
                 if todays:
                     existing = {m['id'] for m in monitored}
-                    new_matches = [m for m in todays if m['id'] not in existing]
-                    if new_matches:
-                        monitored.extend(new_matches)
-                        logger.info(f"➕ Aggiunti {len(new_matches)} nuovi match")
+                    monitored.extend([m for m in todays if m['id'] not in existing])
             
             logger.info(f"⏳ Sleep {CHECK_INTERVAL//60} min...")
             time.sleep(CHECK_INTERVAL)
