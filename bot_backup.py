@@ -14,7 +14,8 @@ RAPIDAPI_HOST = 'soccer-football-info.p.rapidapi.com'
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7969912548:AAFoQzl79K3TiQVnR39ackzVk4JCkDJ3LZQ')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
 
-AVG_THRESHOLD = 2.70
+# FILTRO: Odds Over 2.5 < 1.60 (bookmakers si aspettano 3+ gol)
+ODDS_THRESHOLD = 1.60
 CHECK_INTERVAL = 900
 
 def normalize_team_name(name):
@@ -25,7 +26,7 @@ def normalize_team_name(name):
     return ' '.join(name.split())
 
 def get_todays_matches():
-    """Prendi match di oggi CON calcolo AVG da PPG (senza chiamate extra!)"""
+    """Prendi match con Odds Over 2.5 basse (TUTTE le leghe!)"""
     try:
         url = "https://api.football-data-api.com/todays-matches"
         r = requests.get(url, params={'key': FOOTYSTATS_API_KEY}, timeout=30)
@@ -37,47 +38,50 @@ def get_todays_matches():
             return []
         
         matches = data.get('data', [])
-        logger.info(f"✅ {len(matches)} match oggi")
+        logger.info(f"✅ {len(matches)} match oggi (tutte le leghe)")
         
-        # Filtra e calcola AVG direttamente
+        # Filtra per ODDS
         filtered = []
         for m in matches:
             if m.get('status') not in ['notstarted', '']:
                 continue
             
-            # CALCOLO AVG DA PPG (già nella risposta!)
-            home_ppg = float(m.get('pre_match_teamA_overall_ppg', 0))
-            away_ppg = float(m.get('pre_match_teamB_overall_ppg', 0))
+            # Prendi odds Over 2.5
+            odds_over25 = m.get('odds_over25')
             
-            # AVG stimato = media PPG
-            avg_estimated = (home_ppg + away_ppg) / 2 if (home_ppg + away_ppg) > 0 else 0
+            if not odds_over25:
+                continue
             
-            # Se non c'è PPG, usa seasonAVG
-            if avg_estimated == 0:
-                home_avg = float(m.get('seasonAVG_overall_home', 0))
-                away_avg = float(m.get('seasonAVG_overall_away', 0))
-                avg_estimated = (home_avg + away_avg) / 2
-            
-            if avg_estimated >= AVG_THRESHOLD:
-                filtered.append({
-                    'id': m.get('id'),
-                    'home_name': m.get('home_name', 'Unknown'),
-                    'away_name': m.get('away_name', 'Unknown'),
-                    'home_normalized': normalize_team_name(m.get('home_name')),
-                    'away_normalized': normalize_team_name(m.get('away_name')),
-                    'avg_potential': round(avg_estimated, 2),
-                    'competition_name': m.get('competition_name', 'Unknown'),
-                    'date_unix': m.get('date_unix', 0)
-                })
+            try:
+                odds = float(odds_over25)
+                
+                # FILTRO: Odds < 1.60 = bookmakers si aspettano tanti gol!
+                if odds < ODDS_THRESHOLD:
+                    filtered.append({
+                        'id': m.get('id'),
+                        'home_name': m.get('home_name', 'Unknown'),
+                        'away_name': m.get('away_name', 'Unknown'),
+                        'home_normalized': normalize_team_name(m.get('home_name')),
+                        'away_normalized': normalize_team_name(m.get('away_name')),
+                        'odds_over25': round(odds, 2),
+                        'competition_name': m.get('competition_name', 'Unknown'),
+                        'country': m.get('country', 'Unknown'),
+                        'date_unix': m.get('date_unix', 0)
+                    })
+            except:
+                pass
         
-        logger.info(f"📊 {len(filtered)} match AVG >= {AVG_THRESHOLD}")
+        logger.info(f"📊 {len(filtered)} match con Odds Over 2.5 < {ODDS_THRESHOLD}")
         
-        # Ordina per AVG
-        filtered.sort(key=lambda x: x['avg_potential'], reverse=True)
+        # Ordina per odds (più basse = più probabili)
+        filtered.sort(key=lambda x: x['odds_over25'])
         
-        # Mostra top 10
-        for m in filtered[:10]:
-            logger.info(f"✅ {m['home_name']} vs {m['away_name']} - AVG: {m['avg_potential']}")
+        # Mostra top 15
+        logger.info("\n🔥 TOP 15 MATCH (più probabili):\n")
+        for m in filtered[:15]:
+            logger.info(f"⚽ {m['home_name']} vs {m['away_name']}")
+            logger.info(f"   🏆 {m['country']} - {m['competition_name']}")
+            logger.info(f"   📊 Odds O2.5: {m['odds_over25']}\n")
         
         return filtered
         
@@ -94,7 +98,7 @@ def get_live_matches():
         r.raise_for_status()
         data = r.json()
         live = data.get('result', [])
-        logger.info(f"⚽ {len(live)} live")
+        logger.info(f"⚽ {len(live)} match live")
         return live
     except Exception as e:
         logger.error(f"❌ Live: {e}")
@@ -114,6 +118,7 @@ def check_halftime_00(monitored, live):
                 timer = l.get('timer', '')
                 minute = int(timer.split(':')[0]) if timer and ':' in timer else 0
                 
+                # HT = tra 44-47 minuti
                 if 44 <= minute <= 47:
                     score_a, score_b = team_a.get('score', {}), team_b.get('score', {})
                     if int(score_a.get('f', 0)) == 0 and int(score_b.get('f', 0)) == 0:
@@ -135,42 +140,63 @@ def send_telegram(msg):
 
 def format_alert(alert):
     m, min = alert['match'], alert['minute']
-    return f"""🚨 <b>SEGNALE OVER 1.5 FT</b>
+    
+    # Calcola probabilità implicita
+    odds = m['odds_over25']
+    prob_over25 = round((1 / odds) * 100)
+    
+    message = f"""🚨 <b>SEGNALE OVER 1.5 FT</b> 🚨
 
 ⚽ <b>{m['home_name']} vs {m['away_name']}</b>
-🏆 {m['competition_name']}
-📊 <b>AVG: {m['avg_potential']:.2f}</b>
+🏆 {m['country']} - {m['competition_name']}
 
 ⏱ <b>INTERVALLO ({min}') - 0-0</b>
 
-💡 <b>PUNTA: OVER 1.5 FT</b>
-📈 Quote migliori all'HT!"""
+📊 <b>Odds Over 2.5: {odds}</b>
+📈 Probabilità Over 2.5: <b>{prob_over25}%</b>
+
+💡 <b>STRATEGIA: OVER 1.5 FT</b>
+
+🔥 Bookmakers si aspettavano 3+ gol!
+✅ Servono solo 2 gol per vincere!
+⚡ Probabilità Over 1.5 molto alta!
+"""
+    
+    return message
 
 def main():
     logger.info("="*60)
-    logger.info("🤖 BOT BETTING AVVIATO (OTTIMIZZATO)")
-    logger.info(f"📊 AVG >= {AVG_THRESHOLD} | ⏱ Check ogni {CHECK_INTERVAL//60} min")
+    logger.info("🤖 BOT BETTING - STRATEGIA ODDS")
+    logger.info(f"📊 Filtro: Odds Over 2.5 < {ODDS_THRESHOLD}")
+    logger.info(f"⏱ Check ogni {CHECK_INTERVAL//60} min")
     logger.info("="*60)
     
-    send_telegram("🤖 Bot avviato! (versione ottimizzata)")
+    send_telegram(f"🤖 Bot avviato!\n📊 Filtro: Odds Over 2.5 < {ODDS_THRESHOLD}")
     
     monitored, alerted = [], set()
     todays = get_todays_matches()
     
     if todays:
         monitored = todays
+        
+        # Limita messaggi se troppi match
         if len(monitored) > 20:
             summary = f"📋 <b>Monitoro {len(monitored)} match (top 20):</b>\n\n"
             for m in monitored[:20]:
-                summary += f"• {m['home_name']} vs {m['away_name']} (AVG: {m['avg_potential']:.2f})\n"
-            summary += f"\n...e altri {len(monitored)-20} match"
+                summary += f"• {m['home_name']} vs {m['away_name']}\n"
+                summary += f"  🏆 {m['competition_name']}\n"
+                summary += f"  📊 Odds O2.5: {m['odds_over25']}\n\n"
+            summary += f"...e altri {len(monitored)-20} match"
         else:
             summary = f"📋 <b>Monitoro {len(monitored)} match:</b>\n\n"
             for m in monitored:
-                summary += f"• {m['home_name']} vs {m['away_name']} (AVG: {m['avg_potential']:.2f})\n"
+                summary += f"• {m['home_name']} vs {m['away_name']}\n"
+                summary += f"  🏆 {m['competition_name']}\n"
+                summary += f"  📊 Odds O2.5: {m['odds_over25']}\n\n"
+        
         send_telegram(summary)
     else:
-        send_telegram("⚠️ Nessun match oggi con AVG >= 2.70")
+        send_telegram(f"⚠️ Nessun match oggi con Odds O2.5 < {ODDS_THRESHOLD}")
     
     while True:
         try:
@@ -184,12 +210,16 @@ def main():
                             send_telegram(format_alert(alert))
                             alerted.add(alert['match']['id'])
             
+            # Refresh ogni ora
             if datetime.now().minute == 0:
-                logger.info("🔄 Refresh...")
+                logger.info("🔄 Refresh lista...")
                 todays = get_todays_matches()
                 if todays:
                     existing = {m['id'] for m in monitored}
-                    monitored.extend([m for m in todays if m['id'] not in existing])
+                    new_matches = [m for m in todays if m['id'] not in existing]
+                    if new_matches:
+                        monitored.extend(new_matches)
+                        logger.info(f"➕ Aggiunti {len(new_matches)} nuovi match")
             
             logger.info(f"⏳ Sleep {CHECK_INTERVAL//60} min...")
             time.sleep(CHECK_INTERVAL)
