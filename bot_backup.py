@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
 # Path CSV (nella stessa cartella del bot su GitHub)
 CSV_PATH = 'matches_today.csv'
 
-CHECK_INTERVAL = 900  # 15 minuti
+CHECK_INTERVAL = 180  # 3 minuti (ottimale per catturare tutti gli HT!)
 
 # ============================================
 # FILTRI MULTI-INDICATORE
