@@ -7,7 +7,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Credenziali (con fallback per test locale)
+# Credenziali
 FOOTYSTATS_API_KEY = os.getenv('FOOTYSTATS_API_KEY', '59c0b4d0f445de0323f7e98880350ed6c583d74907ae64b9b59cfde6a09dd811')
 RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9')
 RAPIDAPI_HOST = 'soccer-football-info.p.rapidapi.com'
@@ -25,58 +25,65 @@ def normalize_team_name(name):
     return ' '.join(name.split())
 
 def get_todays_matches():
+    """Prendi match di oggi CON calcolo AVG da PPG (senza chiamate extra!)"""
     try:
         url = "https://api.football-data-api.com/todays-matches"
         r = requests.get(url, params={'key': FOOTYSTATS_API_KEY}, timeout=30)
         r.raise_for_status()
         data = r.json()
-        if data.get('success'):
-            logger.info(f"✅ {len(data.get('data', []))} match oggi")
-            return data.get('data', [])
-        return []
+        
+        if not data.get('success'):
+            logger.error("❌ API error")
+            return []
+        
+        matches = data.get('data', [])
+        logger.info(f"✅ {len(matches)} match oggi")
+        
+        # Filtra e calcola AVG direttamente
+        filtered = []
+        for m in matches:
+            if m.get('status') not in ['notstarted', '']:
+                continue
+            
+            # CALCOLO AVG DA PPG (già nella risposta!)
+            home_ppg = float(m.get('pre_match_teamA_overall_ppg', 0))
+            away_ppg = float(m.get('pre_match_teamB_overall_ppg', 0))
+            
+            # AVG stimato = media PPG
+            avg_estimated = (home_ppg + away_ppg) / 2 if (home_ppg + away_ppg) > 0 else 0
+            
+            # Se non c'è PPG, usa seasonAVG
+            if avg_estimated == 0:
+                home_avg = float(m.get('seasonAVG_overall_home', 0))
+                away_avg = float(m.get('seasonAVG_overall_away', 0))
+                avg_estimated = (home_avg + away_avg) / 2
+            
+            if avg_estimated >= AVG_THRESHOLD:
+                filtered.append({
+                    'id': m.get('id'),
+                    'home_name': m.get('home_name', 'Unknown'),
+                    'away_name': m.get('away_name', 'Unknown'),
+                    'home_normalized': normalize_team_name(m.get('home_name')),
+                    'away_normalized': normalize_team_name(m.get('away_name')),
+                    'avg_potential': round(avg_estimated, 2),
+                    'competition_name': m.get('competition_name', 'Unknown'),
+                    'date_unix': m.get('date_unix', 0)
+                })
+        
+        logger.info(f"📊 {len(filtered)} match AVG >= {AVG_THRESHOLD}")
+        
+        # Ordina per AVG
+        filtered.sort(key=lambda x: x['avg_potential'], reverse=True)
+        
+        # Mostra top 10
+        for m in filtered[:10]:
+            logger.info(f"✅ {m['home_name']} vs {m['away_name']} - AVG: {m['avg_potential']}")
+        
+        return filtered
+        
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         return []
-
-def get_match_details(match_id):
-    try:
-        url = "https://api.football-data-api.com/match"
-        r = requests.get(url, params={'key': FOOTYSTATS_API_KEY, 'match_id': match_id}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        return data.get('data', {}) if data.get('success') else None
-    except Exception as e:
-        logger.error(f"❌ Match {match_id}: {e}")
-        return None
-
-def filter_high_avg_matches(matches):
-    filtered = []
-    logger.info(f"🔍 Filtro AVG > {AVG_THRESHOLD}...")
-    count = 0
-    for m in matches:
-        if m.get('status') not in ['notstarted', '']: continue
-        count += 1
-        if count > 100: break
-        
-        details = get_match_details(m.get('id'))
-        if not details: continue
-        
-        avg = details.get('avg_potential', 0)
-        if avg >= AVG_THRESHOLD:
-            filtered.append({
-                'id': m.get('id'),
-                'home_name': m.get('home_name', 'Unknown'),
-                'away_name': m.get('away_name', 'Unknown'),
-                'home_normalized': normalize_team_name(m.get('home_name')),
-                'away_normalized': normalize_team_name(m.get('away_name')),
-                'avg_potential': avg,
-                'competition_name': m.get('competition_name', 'Unknown')
-            })
-            logger.info(f"✅ {m.get('home_name')} vs {m.get('away_name')} - AVG: {avg:.2f}")
-        time.sleep(0.5)
-    
-    logger.info(f"📊 {len(filtered)} match AVG >= {AVG_THRESHOLD}")
-    return filtered
 
 def get_live_matches():
     try:
@@ -141,21 +148,29 @@ def format_alert(alert):
 
 def main():
     logger.info("="*60)
-    logger.info("🤖 BOT BETTING AVVIATO")
+    logger.info("🤖 BOT BETTING AVVIATO (OTTIMIZZATO)")
     logger.info(f"📊 AVG >= {AVG_THRESHOLD} | ⏱ Check ogni {CHECK_INTERVAL//60} min")
     logger.info("="*60)
     
-    send_telegram("🤖 Bot avviato!")
+    send_telegram("🤖 Bot avviato! (versione ottimizzata)")
     
     monitored, alerted = [], set()
     todays = get_todays_matches()
+    
     if todays:
-        monitored = filter_high_avg_matches(todays)
-        if monitored:
+        monitored = todays
+        if len(monitored) > 20:
+            summary = f"📋 <b>Monitoro {len(monitored)} match (top 20):</b>\n\n"
+            for m in monitored[:20]:
+                summary += f"• {m['home_name']} vs {m['away_name']} (AVG: {m['avg_potential']:.2f})\n"
+            summary += f"\n...e altri {len(monitored)-20} match"
+        else:
             summary = f"📋 <b>Monitoro {len(monitored)} match:</b>\n\n"
             for m in monitored:
                 summary += f"• {m['home_name']} vs {m['away_name']} (AVG: {m['avg_potential']:.2f})\n"
-            send_telegram(summary)
+        send_telegram(summary)
+    else:
+        send_telegram("⚠️ Nessun match oggi con AVG >= 2.70")
     
     while True:
         try:
@@ -170,11 +185,11 @@ def main():
                             alerted.add(alert['match']['id'])
             
             if datetime.now().minute == 0:
+                logger.info("🔄 Refresh...")
                 todays = get_todays_matches()
                 if todays:
-                    new = filter_high_avg_matches(todays)
                     existing = {m['id'] for m in monitored}
-                    monitored.extend([m for m in new if m['id'] not in existing])
+                    monitored.extend([m for m in todays if m['id'] not in existing])
             
             logger.info(f"⏳ Sleep {CHECK_INTERVAL//60} min...")
             time.sleep(CHECK_INTERVAL)
