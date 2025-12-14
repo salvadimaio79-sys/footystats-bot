@@ -14,8 +14,8 @@ RAPIDAPI_HOST = 'soccer-football-info.p.rapidapi.com'
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
 
-# Path CSV (caricato manualmente)
-CSV_PATH = '/mnt/user-data/uploads/matches_expanded-1765723121-ilmaestro79.csv'
+# Path CSV (nella stessa cartella del bot su GitHub)
+CSV_PATH = 'matches_today.csv'
 
 CHECK_INTERVAL = 900  # 15 minuti
 
