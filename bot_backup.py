@@ -265,13 +265,35 @@ def match_teams(csv_match, live_match) -> bool:
     if token_match(csv_home, live_home) and token_match(csv_away, live_away):
         return True
     
-    # 2) Fuzzy fallback
+    # 2) Check acronimi (es. "ABB" vs "Academia Balompie Boliviano")
+    if is_acronym_match(csv_home, live_home) and is_acronym_match(csv_away, live_away):
+        return True
+    
+    # 3) Fuzzy fallback
     rh = fuzzy_ratio(csv_home, live_home)
     ra = fuzzy_ratio(csv_away, live_away)
     if (rh >= 0.72 and ra >= 0.60) or (rh >= 0.60 and ra >= 0.72):
         return True
     
     return False
+
+def is_acronym_match(short: str, long: str) -> bool:
+    """Check se short è acronimo di long (es. ABB = Academia Balompie Boliviano)"""
+    short_clean = norm_text(short).replace(" ", "")
+    long_words = norm_text(long).split()
+    
+    # Se short non è tutto maiuscolo/corto, non è un acronimo
+    if len(short_clean) < 2 or len(short_clean) > 6:
+        return False
+    
+    # Prova a costruire acronimo da long
+    if len(long_words) >= len(short_clean):
+        acronym = "".join(w[0] for w in long_words if w)
+        if short_clean == acronym[:len(short_clean)]:
+            return True
+    
+    # Match normale se non è acronimo
+    return token_match(short, long)
 
 # =========================
 # Business Logic
@@ -311,6 +333,20 @@ def check_matches():
         logger.info("  • %s vs %s (%d') - %s", 
                    lm['home'], lm['away'], lm['minute'], lm['league'])
     
+    # DEBUG: Controlla se "Aurora" è nel CSV
+    logger.info("\n🔎 Cerco 'Aurora' nel CSV...")
+    aurora_found = False
+    for csv_m in filtered:
+        home = csv_m.get("Home Team", "").lower()
+        away = csv_m.get("Away Team", "").lower()
+        if "aurora" in home or "aurora" in away:
+            logger.info("  ✅ TROVATO nel CSV: %s vs %s", 
+                       csv_m.get("Home Team"), csv_m.get("Away Team"))
+            aurora_found = True
+    
+    if not aurora_found:
+        logger.info("  ❌ Aurora NON trovato nel CSV!")
+    
     for csv_m in filtered:
         csv_home = csv_m.get("Home Team", "")
         csv_away = csv_m.get("Away Team", "")
@@ -330,8 +366,9 @@ def check_matches():
             away_score = live_m.get("away_score", 0)
             
             # Log match trovato
-            logger.info("✅ Abbinato: %s vs %s | %d' | %s", 
-                       live_m['home'], live_m['away'], minute, live_m['score_str'])
+            logger.info("✅ ABBINATO: %s vs %s | %d' | %s | CSV: %s vs %s", 
+                       live_m['home'], live_m['away'], minute, live_m['score_str'],
+                       csv_home, csv_away)
             
             # CONDIZIONE: Match a HALFTIME (44-47') E risultato 0-0
             # Invia notifica SUBITO quando trova queste condizioni!
