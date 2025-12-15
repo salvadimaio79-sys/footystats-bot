@@ -1,253 +1,373 @@
 import os
-import csv
 import time
-import requests
-from datetime import datetime
+import csv
+import re
+import unicodedata
+from io import StringIO
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+
 import logging
+import requests
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
+# =========================
+# Logging
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("footystats-bot")
 
-# Credenziali
-RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9')
-RAPIDAPI_HOST = 'soccer-football-info.p.rapidapi.com'
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '6146221712')
+# =========================
+# Environment
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN", "7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI")
+CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID", "6146221712")
 
-# Path CSV (nella stessa cartella del bot su GitHub)
-CSV_PATH = 'matches_today.csv'
+RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "785e7ea308mshc88fb29d2de2ac7p12a681jsn71d79500bcd9")
+RAPIDAPI_HOST  = "soccer-football-info.p.rapidapi.com"
 
-CHECK_INTERVAL = 180  # 3 minuti (ottimale per catturare tutti gli HT!)
+# CSV su GitHub
+GITHUB_CSV_URL = "https://raw.githubusercontent.com/salvadimaio79-sys/footystats-bot/main/matches_today.csv"
 
-# ============================================
-# FILTRI MULTI-INDICATORE
-# ============================================
+# Filtri
+AVG_GOALS_THRESHOLD = float(os.getenv("AVG_GOALS_THRESHOLD", "2.70"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))  # 3 minuti
 
-FILTERS = {
-    'avg_goals_min': 2.70,        # AVG Goals minimo
-    'over25_avg_min': 70,          # Over 2.5 % minimo
-    'over15_2hg_min': 50,          # Over 1.5 nel 2° tempo % minimo
-    'over15_avg_min': 80,          # Over 1.5 generale % minimo
-    'btts_avg_min': 60             # BTTS % minimo (opzionale)
-}
+# Esclusioni leghe
+LEAGUE_EXCLUDE_KEYWORDS = [
+    "esoccer", "volta", "8 mins", "h2h", "e-football", "fifa", "pes"
+]
 
-def normalize_team_name(name):
-    import unicodedata, re
-    if not name: return ""
-    name = ''.join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
-    name = re.sub(r'[^a-z0-9\s]', '', name.lower())
-    return ' '.join(name.split())
+# Cache notifiche
+notified_matches: set[str] = set()
 
-def load_matches_from_csv():
-    """Carica match dal CSV con filtro multi-indicatore"""
+# =========================
+# Telegram
+# =========================
+def send_telegram_message(message: str) -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("TELEGRAM_TOKEN/CHAT_ID mancanti")
+        return False
     try:
-        if not os.path.exists(CSV_PATH):
-            logger.error(f"❌ File CSV non trovato: {CSV_PATH}")
-            return []
-        
-        matches = []
-        
-        with open(CSV_PATH, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            
-            for row in reader:
-                status = row.get('Match Status', '')
-                
-                # Solo match non iniziati
-                if status not in ['incomplete', 'notstarted', '']:
-                    continue
-                
-                try:
-                    # Estrai indicatori
-                    avg_goals = float(row.get('Average Goals', 0))
-                    over15_avg = float(row.get('Over15 Average', 0))
-                    over25_avg = float(row.get('Over25 Average', 0))
-                    btts_avg = float(row.get('BTTS Average', 0))
-                    over15_2hg = float(row.get('Over15 2HG Average', 0))
-                    
-                    # APPLICA FILTRI
-                    if (avg_goals >= FILTERS['avg_goals_min'] and
-                        over25_avg >= FILTERS['over25_avg_min'] and
-                        over15_2hg >= FILTERS['over15_2hg_min'] and
-                        over15_avg >= FILTERS['over15_avg_min']):
-                        
-                        # Match qualificato!
-                        home = row.get('Home Team', 'Unknown')
-                        away = row.get('Away Team', 'Unknown')
-                        
-                        matches.append({
-                            'home_name': home,
-                            'away_name': away,
-                            'home_normalized': normalize_team_name(home),
-                            'away_normalized': normalize_team_name(away),
-                            'league': row.get('League', 'Unknown'),
-                            'country': row.get('Country', 'Unknown'),
-                            # Statistiche
-                            'avg_goals': round(avg_goals, 2),
-                            'over15_avg': round(over15_avg, 1),
-                            'over25_avg': round(over25_avg, 1),
-                            'btts_avg': round(btts_avg, 1),
-                            'over15_2hg': round(over15_2hg, 1),
-                            # Score qualità
-                            'quality_score': round(avg_goals + over25_avg/100 + over15_2hg/100, 2)
-                        })
-                
-                except Exception as e:
-                    continue
-        
-        # Ordina per quality score
-        matches.sort(key=lambda x: x['quality_score'], reverse=True)
-        
-        logger.info(f"✅ Caricati {len(matches)} match dal CSV")
-        
-        # Mostra top 10
-        if matches:
-            logger.info("\n🔥 TOP 10 MATCH:\n")
-            for m in matches[:10]:
-                logger.info(f"⚽ {m['home_name']} vs {m['away_name']}")
-                logger.info(f"   🏆 {m['country']} - {m['league']}")
-                logger.info(f"   📊 AVG: {m['avg_goals']} | O2.5: {m['over25_avg']}% | O1.5 2T: {m['over15_2hg']}%\n")
-        
-        return matches
-        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
+        if r.ok:
+            logger.info("✅ Telegram inviato")
+            return True
+        logger.error("❌ Telegram %s: %s", r.status_code, r.text)
     except Exception as e:
-        logger.error(f"❌ Errore lettura CSV: {e}")
+        logger.exception("❌ Telegram exception: %s", e)
+    return False
+
+# =========================
+# CSV da GitHub
+# =========================
+def load_csv_from_github():
+    try:
+        logger.info("📥 Scarico CSV: %s", GITHUB_CSV_URL)
+        r = requests.get(GITHUB_CSV_URL, timeout=30)
+        r.raise_for_status()
+        rows = list(csv.DictReader(StringIO(r.text)))
+        logger.info("✅ CSV caricato (%d righe)", len(rows))
+        return rows
+    except Exception as e:
+        logger.exception("❌ Errore caricamento CSV: %s", e)
         return []
 
+def get_avg_goals(row) -> float:
+    """Estrae AVG Goals dal CSV"""
+    keys = [
+        "Average Goals", "AVG Goals", "AvgGoals", "Avg Goals",
+        "Avg Total Goals", "Average Total Goals"
+    ]
+    for k in keys:
+        v = row.get(k)
+        if v and str(v).strip():
+            try:
+                return float(str(v).replace(",", "."))
+            except:
+                pass
+    return 0.0
+
+def filter_matches_by_avg(matches):
+    """Filtra match con AVG >= soglia"""
+    filtered = []
+    for m in matches:
+        try:
+            avg = get_avg_goals(m)
+            if avg >= AVG_GOALS_THRESHOLD:
+                filtered.append(m)
+        except:
+            pass
+    
+    logger.info("📊 Filtrati %d match con AVG >= %.2f", len(filtered), AVG_GOALS_THRESHOLD)
+    
+    # Mostra top 10
+    if filtered:
+        sorted_matches = sorted(filtered, key=lambda x: get_avg_goals(x), reverse=True)
+        logger.info("\n🔥 TOP 10 MATCH:\n")
+        for m in sorted_matches[:10]:
+            home = m.get("Home Team", "")
+            away = m.get("Away Team", "")
+            avg = get_avg_goals(m)
+            league = m.get("League", "")
+            logger.info(f"⚽ {home} vs {away} | AVG: {avg:.2f} | {league}")
+    
+    return filtered
+
+# =========================
+# Live events (Soccer Football Info API)
+# =========================
 def get_live_matches():
+    """Prendi match live da Soccer Football Info API"""
     try:
         url = f"https://{RAPIDAPI_HOST}/live/full/"
-        headers = {'x-rapidapi-key': RAPIDAPI_KEY, 'x-rapidapi-host': RAPIDAPI_HOST}
-        params = {'i': 'en_US', 'f': 'json', 'e': 'no'}
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
+        headers = {
+            'x-rapidapi-key': RAPIDAPI_KEY,
+            'x-rapidapi-host': RAPIDAPI_HOST
+        }
+        params = {
+            'i': 'en_US',
+            'f': 'json',
+            'e': 'no'
+        }
+        
+        r = requests.get(url, headers=headers, params=params, timeout=25)
+        
+        if not r.ok:
+            logger.error("❌ API live: HTTP %s", r.status_code)
+            return []
+        
         data = r.json()
-        live = data.get('result', [])
-        logger.info(f"⚽ {len(live)} match live")
-        return live
+        events = data.get("result", [])
+        
+        # Filtra ed estrai dati
+        live_matches = []
+        for event in events:
+            team_a = event.get("teamA", {})
+            team_b = event.get("teamB", {})
+            
+            home_name = team_a.get("name", "").strip()
+            away_name = team_b.get("name", "").strip()
+            
+            if not home_name or not away_name:
+                continue
+            
+            # Estrai lega
+            league = event.get("league", {})
+            league_name = league.get("name", "Unknown") if isinstance(league, dict) else str(league)
+            
+            # Escludi esports/virtuals
+            if any(kw in league_name.lower() for kw in LEAGUE_EXCLUDE_KEYWORDS):
+                continue
+            
+            # Estrai minuto
+            timer = event.get("timer", "")
+            minute = 0
+            if timer and ':' in timer:
+                try:
+                    minute = int(timer.split(':')[0])
+                except:
+                    minute = 0
+            
+            # Estrai score
+            score_a = team_a.get("score", {})
+            score_b = team_b.get("score", {})
+            home_score = int(score_a.get("f", 0)) if isinstance(score_a, dict) else 0
+            away_score = int(score_b.get("f", 0)) if isinstance(score_b, dict) else 0
+            
+            live_matches.append({
+                "home": home_name,
+                "away": away_name,
+                "league": league_name,
+                "minute": minute,
+                "home_score": home_score,
+                "away_score": away_score,
+                "score_str": f"{home_score}-{away_score}"
+            })
+        
+        logger.info("⚽ %d match live (dopo filtri)", len(live_matches))
+        return live_matches
+        
     except Exception as e:
-        logger.error(f"❌ Live: {e}")
+        logger.exception("❌ Errore get_live_matches: %s", e)
         return []
 
-def check_halftime_00(monitored, live):
-    alerts = []
-    for mon in monitored:
-        for l in live:
-            team_a, team_b = l.get('teamA', {}), l.get('teamB', {})
-            live_home_norm = normalize_team_name(team_a.get('name', ''))
-            live_away_norm = normalize_team_name(team_b.get('name', ''))
-            
-            if (mon['home_normalized'] in live_home_norm or live_home_norm in mon['home_normalized']) and \
-               (mon['away_normalized'] in live_away_norm or live_away_norm in mon['away_normalized']):
-                
-                timer = l.get('timer', '')
-                minute = int(timer.split(':')[0]) if timer and ':' in timer else 0
-                
-                if 44 <= minute <= 47:
-                    score_a, score_b = team_a.get('score', {}), team_b.get('score', {})
-                    if int(score_a.get('f', 0)) == 0 and int(score_b.get('f', 0)) == 0:
-                        alerts.append({'match': mon, 'minute': minute})
-                        logger.info(f"🎯 {mon['home_name']} vs {mon['away_name']} 0-0 HT!")
-                break
-    return alerts
+# =========================
+# Matching nomi squadre (TUA LOGICA ORIGINALE)
+# =========================
+STOPWORDS = {
+    "fc", "cf", "sc", "ac", "club", "cd", "de", "del", "da", "do", "d",
+    "u19", "u20", "u21", "u23", "b", "ii", "iii", "women", "w",
+    "reserves", "team", "sv", "afc", "youth", "if", "fk"
+}
 
-def send_telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
-        r.raise_for_status()
-        logger.info("✅ Telegram OK")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Telegram: {e}")
+def strip_accents(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s or "")
+        if not unicodedata.combining(c)
+    )
+
+def norm_text(s: str) -> str:
+    s = strip_accents(s).lower()
+    s = re.sub(r"\(.*?\)", " ", s)  # rimuovi parentesi
+    s = re.sub(r"[''`]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+def team_tokens(name: str) -> set[str]:
+    toks = [t for t in norm_text(name).split() if t and t not in STOPWORDS]
+    toks = [t for t in toks if len(t) >= 3 or t.isdigit()]
+    return set(toks)
+
+def token_match(a: str, b: str) -> bool:
+    A, B = team_tokens(a), team_tokens(b)
+    if not A or not B:
         return False
+    if A == B or A.issubset(B) or B.issubset(A):
+        return True
+    inter = A & B
+    if len(A) == 1 or len(B) == 1:
+        return len(inter) >= 1
+    return len(inter) >= 2
 
-def format_alert(alert):
-    m, min = alert['match'], alert['minute']
+def fuzzy_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
+
+def match_teams(csv_match, live_match) -> bool:
+    """Verifica se CSV match e live match sono lo stesso"""
+    csv_home = csv_match.get("Home Team") or csv_match.get("Home") or ""
+    csv_away = csv_match.get("Away Team") or csv_match.get("Away") or ""
+    live_home = live_match.get("home", "")
+    live_away = live_match.get("away", "")
     
-    return f"""🚨 <b>SEGNALE ULTRA-FORTE!</b> 🚨
+    # 1) Token match (veloce)
+    if token_match(csv_home, live_home) and token_match(csv_away, live_away):
+        return True
+    
+    # 2) Fuzzy fallback
+    rh = fuzzy_ratio(csv_home, live_home)
+    ra = fuzzy_ratio(csv_away, live_away)
+    if (rh >= 0.72 and ra >= 0.60) or (rh >= 0.60 and ra >= 0.72):
+        return True
+    
+    return False
 
-⚽ <b>{m['home_name']} vs {m['away_name']}</b>
-🏆 {m['country']} - {m['league']}
-
-⏱ <b>INTERVALLO ({min}') - 0-0</b>
-
-📊 <b>STATISTICHE:</b>
-   • AVG Goals: <b>{m['avg_goals']}</b>
-   • Over 2.5: <b>{m['over25_avg']}%</b>
-   • Over 1.5 (2T): <b>{m['over15_2hg']}%</b>
-   • BTTS: <b>{m['btts_avg']}%</b>
-
-💡 <b>STRATEGIA: OVER 1.5 FT</b>
-
-🔥 Match con TUTTI gli indicatori positivi!
-✅ Nel 2° tempo segnano in media {m['over15_2hg']}% volte
-⚡ Probabilità MOLTO ALTA di 2+ gol FT!
-
-🎯 <b>Quality Score: {m['quality_score']}/10</b>
-"""
+# =========================
+# Business Logic
+# =========================
+def check_matches():
+    logger.info("\n" + "=" * 70)
+    logger.info("🔄 INIZIO CONTROLLO (%s)", datetime.now().strftime("%H:%M:%S"))
+    logger.info("=" * 70)
+    
+    # Carica CSV
+    csv_matches = load_csv_from_github()
+    if not csv_matches:
+        logger.warning("⚠️ CSV vuoto o non caricato")
+        return
+    
+    # Filtra per AVG
+    filtered = filter_matches_by_avg(csv_matches)
+    if not filtered:
+        logger.info("⚠️ Nessun match con AVG >= %.2f", AVG_GOALS_THRESHOLD)
+        return
+    
+    # Prendi live
+    live = get_live_matches()
+    if not live:
+        logger.info("⚠️ Nessun match live al momento")
+        return
+    
+    # Cerca opportunità
+    matched = 0
+    opportunities = 0
+    
+    logger.info("\n🔍 Cerco abbinamenti CSV ↔ Live...")
+    
+    for csv_m in filtered:
+        csv_home = csv_m.get("Home Team", "")
+        csv_away = csv_m.get("Away Team", "")
+        
+        for live_m in live:
+            # Match squadre
+            if not match_teams(csv_m, live_m):
+                continue
+            
+            matched += 1
+            minute = live_m.get("minute", 0)
+            home_score = live_m.get("home_score", 0)
+            away_score = live_m.get("away_score", 0)
+            
+            # Log match trovato
+            logger.info("✅ Abbinato: %s vs %s | %d' | %s", 
+                       live_m['home'], live_m['away'], minute, live_m['score_str'])
+            
+            # CONDIZIONE: Match a HALFTIME (44-47') E risultato 0-0
+            # Invia notifica SUBITO quando trova queste condizioni!
+            if 44 <= minute <= 47 and home_score == 0 and away_score == 0:
+                # Genera chiave unica per evitare notifiche duplicate
+                key = f"{live_m['home']}|{live_m['away']}"
+                
+                # Se già notificato questo match, salta
+                if key in notified_matches:
+                    continue
+                
+                # Prepara messaggio alert
+                avg = get_avg_goals(csv_m)
+                
+                msg = (
+                    "🚨 <b>SEGNALE OVER 1.5 FT!</b> 🚨\n\n"
+                    f"⚽ <b>{live_m['home']} vs {live_m['away']}</b>\n"
+                    f"🏆 {live_m['league']}\n\n"
+                    f"⏱️ <b>MINUTO: {minute}'</b>\n"
+                    f"📊 <b>RISULTATO: {live_m['score_str']}</b>\n\n"
+                    f"📈 AVG Goals: <b>{avg:.2f}</b>\n\n"
+                    "💡 <b>STRATEGIA: PUNTA OVER 1.5 FT</b>\n"
+                    "✅ Match 0-0 a fine primo tempo!\n"
+                    "🔥 Squadre ad alto punteggio!"
+                )
+                
+                # Invia
+                if send_telegram_message(msg):
+                    notified_matches.add(key)
+                    opportunities += 1
+                    logger.info("🎯 ALERT INVIATO: %s vs %s (%d')", 
+                              live_m['home'], live_m['away'], minute)
+    
+    logger.info("📊 Riepilogo: %d abbinati CSV↔Live | %d opportunità trovate", 
+                matched, opportunities)
+    logger.info("=" * 70)
 
 def main():
-    logger.info("="*70)
-    logger.info("🤖 BOT BETTING - STRATEGIA MULTI-INDICATORE CSV")
-    logger.info("="*70)
-    logger.info(f"\n📊 FILTRI ATTIVI:")
-    logger.info(f"   • AVG Goals >= {FILTERS['avg_goals_min']}")
-    logger.info(f"   • Over 2.5 % >= {FILTERS['over25_avg_min']}%")
-    logger.info(f"   • Over 1.5 (2T) % >= {FILTERS['over15_2hg_min']}%")
-    logger.info(f"   • Over 1.5 % >= {FILTERS['over15_avg_min']}%")
-    logger.info(f"\n⏱ Check ogni {CHECK_INTERVAL//60} minuti")
-    logger.info("="*70)
+    logger.info("\n" + "=" * 70)
+    logger.info("🤖 FOOTYSTATS BOT - VERSIONE FINALE")
+    logger.info("=" * 70)
+    logger.info(f"📊 Soglia AVG: {AVG_GOALS_THRESHOLD}")
+    logger.info(f"⏱️ Check ogni: {CHECK_INTERVAL} secondi ({CHECK_INTERVAL//60} minuti)")
+    logger.info(f"📥 CSV: {GITHUB_CSV_URL}")
+    logger.info("=" * 70)
     
-    send_telegram("🤖 Bot CSV Multi-Indicatore avviato!\n📊 Carico match dal CSV...")
+    # Messaggio startup
+    send_telegram_message(
+        "🤖 <b>Bot FootyStats Avviato!</b>\n\n"
+        f"📊 Soglia AVG: {AVG_GOALS_THRESHOLD}\n"
+        f"⏱️ Check ogni {CHECK_INTERVAL//60} minuti\n"
+        "✅ Monitoraggio attivo..."
+    )
     
-    # Carica match dal CSV
-    monitored = load_matches_from_csv()
-    alerted = set()
-    
-    if monitored:
-        # Prepara summary
-        if len(monitored) > 15:
-            summary = f"📋 <b>Monitoro {len(monitored)} match (top 15):</b>\n\n"
-            for m in monitored[:15]:
-                summary += f"• {m['home_name']} vs {m['away_name']}\n"
-                summary += f"  📊 AVG: {m['avg_goals']} | O2.5: {m['over25_avg']}%\n"
-                summary += f"  🔥 Score: {m['quality_score']}/10\n\n"
-            summary += f"...e altri {len(monitored)-15} match"
-        else:
-            summary = f"📋 <b>Monitoro {len(monitored)} match:</b>\n\n"
-            for m in monitored:
-                summary += f"• {m['home_name']} vs {m['away_name']}\n"
-                summary += f"  📊 AVG: {m['avg_goals']} | O2.5: {m['over25_avg']}%\n"
-                summary += f"  🔥 Score: {m['quality_score']}/10\n\n"
-        
-        send_telegram(summary)
-    else:
-        send_telegram("⚠️ Nessun match trovato nel CSV con i filtri attuali.\n\n💡 Carica il CSV in /mnt/user-data/uploads/matches_today.csv")
-    
-    # Loop monitoring
     while True:
         try:
-            logger.info(f"\n{'='*70}\n🔄 CHECK ({datetime.now().strftime('%H:%M:%S')})\n{'='*70}")
-            
-            if monitored:
-                live = get_live_matches()
-                if live:
-                    for alert in check_halftime_00(monitored, live):
-                        match_id = f"{alert['match']['home_name']}_{alert['match']['away_name']}"
-                        
-                        if match_id not in alerted:
-                            send_telegram(format_alert(alert))
-                            alerted.add(match_id)
-            
-            logger.info(f"⏳ Sleep {CHECK_INTERVAL//60} min...")
+            check_matches()
+            logger.info("⏳ Sleep %d secondi...\n", CHECK_INTERVAL)
             time.sleep(CHECK_INTERVAL)
             
         except KeyboardInterrupt:
-            send_telegram("🛑 Bot fermato")
+            logger.info("\n👋 Bot fermato dall'utente")
+            send_telegram_message("🛑 Bot arrestato")
             break
+            
         except Exception as e:
-            logger.error(f"❌ {e}")
+            logger.exception("❌ Errore nel loop principale: %s", e)
             time.sleep(60)
 
 if __name__ == "__main__":
