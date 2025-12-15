@@ -89,10 +89,30 @@ def get_avg_goals(row) -> float:
     return 0.0
 
 def filter_matches_by_avg(matches):
-    """Filtra match con AVG >= soglia"""
+    """Filtra match con AVG >= soglia ED esclude esports"""
     filtered = []
+    excluded_esports = 0
+    
     for m in matches:
         try:
+            # Escludi esports/virtuali
+            league = m.get("League", "").lower()
+            country = m.get("Country", "").lower()
+            
+            # Lista esclusioni
+            exclude_keywords = [
+                "esoccer", "esports", "e-soccer", "e-sports",
+                "fifa", "pes", "efootball", "e-football",
+                "volta", "8 mins", "h2h", "battle",
+                "virtual", "cyber"
+            ]
+            
+            # Se contiene keyword esclusa, salta
+            if any(kw in league or kw in country for kw in exclude_keywords):
+                excluded_esports += 1
+                continue
+            
+            # Controlla AVG
             avg = get_avg_goals(m)
             if avg >= AVG_GOALS_THRESHOLD:
                 filtered.append(m)
@@ -100,6 +120,7 @@ def filter_matches_by_avg(matches):
             pass
     
     logger.info("📊 Filtrati %d match con AVG >= %.2f", len(filtered), AVG_GOALS_THRESHOLD)
+    logger.info("❌ Esclusi %d match esports/virtuali", excluded_esports)
     
     # Mostra top 10
     if filtered:
@@ -284,9 +305,19 @@ def check_matches():
     
     logger.info("\n🔍 Cerco abbinamenti CSV ↔ Live...")
     
+    # DEBUG: Mostra i match live
+    logger.info("\n📋 MATCH LIVE TROVATI:")
+    for lm in live[:10]:  # Mostra primi 10
+        logger.info("  • %s vs %s (%d') - %s", 
+                   lm['home'], lm['away'], lm['minute'], lm['league'])
+    
     for csv_m in filtered:
         csv_home = csv_m.get("Home Team", "")
         csv_away = csv_m.get("Away Team", "")
+        
+        # DEBUG: Mostra primi 5 match CSV che cerca
+        if matched == 0 and filtered.index(csv_m) < 5:
+            logger.info("\n🔎 Cerco nel CSV: %s vs %s", csv_home, csv_away)
         
         for live_m in live:
             # Match squadre
