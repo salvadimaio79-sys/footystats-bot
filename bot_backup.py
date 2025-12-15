@@ -282,17 +282,23 @@ def is_acronym_match(short: str, long: str) -> bool:
     short_clean = norm_text(short).replace(" ", "")
     long_words = norm_text(long).split()
     
-    # Se short non è tutto maiuscolo/corto, non è un acronimo
-    if len(short_clean) < 2 or len(short_clean) > 6:
-        return False
+    # Filtra stopwords per acronimo
+    long_words_filtered = [w for w in long_words if w not in STOPWORDS and len(w) >= 3]
     
-    # Prova a costruire acronimo da long
-    if len(long_words) >= len(short_clean):
-        acronym = "".join(w[0] for w in long_words if w)
+    # Se short non è corto, non è un acronimo
+    if len(short_clean) < 2 or len(short_clean) > 6:
+        return token_match(short, long)
+    
+    # Prova a costruire acronimo da long (senza stopwords)
+    if len(long_words_filtered) >= len(short_clean):
+        acronym = "".join(w[0] for w in long_words_filtered if w)
+        # Match se acronimo corrisponde
         if short_clean == acronym[:len(short_clean)]:
             return True
+        if short_clean == acronym:
+            return True
     
-    # Match normale se non è acronimo
+    # Se non è acronimo, usa token match normale
     return token_match(short, long)
 
 # =========================
